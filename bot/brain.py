@@ -125,7 +125,10 @@ def bootstrap(st):
     prompt = (
         f"You are the autonomous strategy brain of a ${START_BAL:.0f} crypto "
         f"paper-trading account on 1-minute candles, executed by a cron job "
-        f"every ~5 minutes (signals on closed candles). Design the initial "
+        f"every ~5 minutes (signals on closed candles). Fills pay realistic "
+        f"spread costs: BTC ~0.02%, ETH ~0.16%, SOL ~0.25% round trip "
+        f"(commission zero) - avoid setups whose edge is eaten by spread. "
+        f"Design the initial "
         f"strategy AND every risk parameter yourself. Be selective - quality "
         f"over quantity - and conservative on a small account. "
         f"Market snapshot: {'; '.join(snap)}. "
@@ -157,8 +160,8 @@ def review(st):
     s = stats(st["trades"])
     recent = "\n".join(
         f'{t["market"]} {t["side"]} {t["entry"]:.2f}->{t["exit"]:.2f} '
-        f'pnl {t["pnl"]:.2f} ({t["exit_reason"]}, {t["held_min"]}m, '
-        f'v{t["strategy_version"]})'
+        f'pnl {t["pnl"]:.2f} cost {t.get("cost", 0):.2f} '
+        f'({t["exit_reason"]}, {t["held_min"]}m, v{t["strategy_version"]})'
         for t in st["trades"][:20])
     by_reason = {}
     for t in st["trades"]:
@@ -168,7 +171,10 @@ def review(st):
     cur.pop("version", None)
     prompt = (
         f"You are the self-learning brain of a ${START_BAL:.0f} crypto paper "
-        f"account (1-min candles, cron-executed). Review your own journal, "
+        f"account (1-min candles, cron-executed). Every fill pays realistic "
+        f"spread: BTC ~0.02%, ETH ~0.16%, SOL ~0.25% round trip. The cost "
+        f"column in trades shows spread paid - overtrading and tight targets "
+        f"bleed money. Review your own journal, "
         f"name your mistakes, and output an IMPROVED strategy. You may change "
         f"indicators, thresholds, markets, R:R, sizing, hold time, or simply "
         f"trade less. Never increase risk after losses.\n\n"

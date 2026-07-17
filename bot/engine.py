@@ -15,6 +15,9 @@ MARKETS = {
     "ETH": {"kraken": "ETHUSD", "coinbase": "ETH-USD", "binance": "ETHUSDT"},
     "SOL": {"kraken": "SOLUSD", "coinbase": "SOL-USD", "binance": "SOLUSDT"},
 }
+# Full bid-ask spread as % of price (IC Markets-style crypto CFD quotes,
+# commission zero). Entries/exits pay half the spread each side.
+SPREAD_PCT = {"BTC": 0.02, "ETH": 0.16, "SOL": 0.25}
 MK = list(MARKETS.keys())
 START_BAL = 2000.0
 REVIEW_EVERY = 8
@@ -187,14 +190,26 @@ def log(st, msg, kind="info", t=None):
 
 
 # ---------------- trading ----------------
+def _fill(mkt, side, mid, is_entry):
+    """Convert a mid price into a realistic fill: longs buy the ask and
+    sell the bid; shorts the reverse. Half the spread each side."""
+    half = SPREAD_PCT.get(mkt, 0.1) / 100 / 2
+    if side == "long":
+        return mid * (1 + half) if is_entry else mid * (1 - half)
+    return mid * (1 - half) if is_entry else mid * (1 + half)
+
+
 def _close(st, pos, price, reason, t):
-    pnl = (price - pos["entry"] if pos["side"] == "long"
-           else pos["entry"] - price) * pos["units"]
+    fill_px = _fill(pos["market"], pos["side"], price, False)
+    pnl = (fill_px - pos["entry"] if pos["side"] == "long"
+           else pos["entry"] - fill_px) * pos["units"]
     st["balance"] += pnl
+    spread_cost = pos["units"] * price * SPREAD_PCT.get(pos["market"], 0.1) / 100
     st["trades"] = ([{
         "id": pos["id"], "market": pos["market"], "side": pos["side"],
-        "entry": pos["entry"], "exit": price, "units": pos["units"],
-        "pnl": round(pnl, 2), "t_in": pos["t_in"], "t_out": t,
+        "entry": pos["entry"], "exit": fill_px, "units": pos["units"],
+        "pnl": round(pnl, 2), "cost": round(spread_cost, 2),
+        "t_in": pos["t_in"], "t_out": t,
         "held_min": round((t - pos["t_in"]) / 60_000),
         "exit_reason": reason, "strategy_version": pos["strategy_version"],
     }] + st["trades"])[:500]
@@ -209,23 +224,24 @@ def _close(st, pos, price, reason, t):
 
 def _open(st, mkt, side, price, t):
     r = st["strategy"]["risk"]
-    risk_usd = st["equity"] * r["riskPerTradePct"] / 100
-    units = risk_usd / (price * r["stopLossPct"] / 100)
-    units = min(units, st["equity"] * 5 / price)  # 5x notional cap
-    sl = price * (1 - r["stopLossPct"] / 100) if side == "long" \
-        else price * (1 + r["stopLossPct"] / 100)
-    tp = price * (1 + r["takeProfitPct"] / 100) if side == "long" \
-        else price * (1 - r["takeProfitPct"] / 100)
+    entry_px = _fill(mkt, side, price, True)  # pay half-spread on entry
+    risk_usd = st["equity"] * (r["riskPerTradePct"] / 100)
+    units = risk_usd / (entry_px * (r["stopLossPct"] / 100))
+    units = min(units, st["equity"] * 5 / entry_px)  # 5x notional cap
+    sl = entry_px * (1 - r["stopLossPct"] / 100) if side == "long" \
+        else entry_px * (1 + r["stopLossPct"] / 100)
+    tp = entry_px * (1 + r["takeProfitPct"] / 100) if side == "long" \
+        else entry_px * (1 - r["takeProfitPct"] / 100)
     st["seq"] += 1
     st["positions"].append({
-        "id": st["seq"], "market": mkt, "side": side, "entry": price,
+        "id": st["seq"], "market": mkt, "side": side, "entry": entry_px,
         "units": units, "sl": sl, "tp": tp,
-        "trail": r.get("trailingStopPct", 0) or 0, "best": price,
+        "trail": r.get("trailingStopPct", 0) or 0, "best": entry_px,
         "t_in": t, "strategy_version": st["strategy"]["version"],
         "risk_usd": round(risk_usd, 2),
     })
-    log(st, f"ENTER {mkt} {side} @ {price:.2f} | SL {sl:.2f} TP {tp:.2f} "
-            f"| risk ${risk_usd:.2f}", "trade", t)
+    log(st, f"ENTER {mkt} {side} @ {entry_px:.2f} (incl. spread) | "
+            f"SL {sl:.2f} TP {tp:.2f} | risk ${risk_usd:.2f}", "trade", t)
 
 
 def _mark_equity(st, t, throttle_ms=10 * 60_000):
