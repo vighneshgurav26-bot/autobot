@@ -1,9 +1,14 @@
-"""Entry point for each cron run.
+"""Entry point for each cron run (v3).
 
 1. Load state.json (or start a fresh $2,000 account)
-2. Warm up / catch up: fetch every closed 1-min candle since last run
-3. Replay them through the engine in time order (trades happen here)
-4. Design or review the strategy via Claude when due
+2. If no strategy yet: preload 15m history, let Claude design one
+   (it picks its own timeframe + markets); rebuild history if it
+   chose a different timeframe
+3. Fetch every newly closed candle at the strategy's timeframe and
+   replay through the engine (trades happen here). Markets seen for
+   the first time warm up without trading on stale bars.
+4. Self-review every 8 closed trades; if the review changes the
+   timeframe, candle history is wiped and rebuilt next runs.
 5. Save state.json + docs/data.json for the dashboard
 """
 import json
@@ -12,23 +17,55 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from engine import (MK, REVIEW_EVERY, fresh_state, get_closed_candles, log,
-                    now_ms, process_bar, stats)
+from engine import (MK, TF_MIN, DEFAULT_TF, WARMUP_BARS, REVIEW_EVERY,
+                    fresh_state, get_closed_candles, log, now_ms,
+                    process_bar, stats, wipe_candles)
 import brain
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_PATH = os.path.join(ROOT, "state.json")
 DATA_PATH = os.path.join(ROOT, "docs", "data.json")
-WARMUP_MS = 6 * 3600 * 1000  # first ever run: 6h of history for indicators
 
 
 def load_state():
     try:
         with open(STATE_PATH) as f:
-            st = {**fresh_state(), **json.load(f)}
-        return st, False
+            return {**fresh_state(), **json.load(f)}, False
     except Exception:
         return fresh_state(), True
+
+
+def fetch_all(st, tf_name):
+    """Fetch new closed candles for every market at tf, oldest first.
+    Returns (list of (mkt, bar), set of markets that started empty)."""
+    tfm = TF_MIN[tf_name]
+    fetched, fresh_markets = [], set()
+    for m in MK:
+        since = st["last_seen"].get(m) or (now_ms() - WARMUP_BARS * tfm * 60_000)
+        if not st["candles"][m]:
+            fresh_markets.add(m)
+        for bar in get_closed_candles(m, since, tfm):
+            fetched.append((m, bar))
+    fetched.sort(key=lambda x: x[1]["t"])
+    return fetched, fresh_markets
+
+
+def replay(st, fetched, fresh_markets):
+    """Process bars in time order. Markets warming up (first time seen)
+    only allow entries on their final 2 bars, so we never trade stale
+    history."""
+    counts = {}
+    for m, _ in fetched:
+        counts[m] = counts.get(m, 0) + 1
+    seen = {}
+    for m, bar in fetched:
+        if st["candles"][m] and bar["t"] <= st["candles"][m][-1]["t"]:
+            continue
+        seen[m] = seen.get(m, 0) + 1
+        allow = True
+        if m in fresh_markets and seen[m] <= counts[m] - 2:
+            allow = False
+        process_bar(st, m, bar, allow_entry=allow)
 
 
 def main():
@@ -36,52 +73,52 @@ def main():
     if first_run:
         log(st, "Fresh $2,000 paper account initialised.")
 
-    # ---- catch up on every market ----
-    fetched = []
-    for m in MK:
-        since = st["last_seen"].get(m) or (now_ms() - WARMUP_MS)
-        for bar in get_closed_candles(m, since):
-            fetched.append((m, bar))
-    fetched.sort(key=lambda x: x[1]["t"])
-
-    feed_ok = bool(fetched)
-    if not feed_ok:
-        log(st, "No new candles this run (feeds unreachable or no gap).", "warn")
-
-    if first_run and fetched:
-        # warm indicators without trading on stale history:
-        # replay all but the last 30 bars per market with strategy disabled
-        counts = {}
-        for m, _ in fetched:
-            counts[m] = counts.get(m, 0) + 1
-        seen = {}
-        strategy_backup, st["strategy"] = st["strategy"], None
-        live_tail = []
+    # ---- bootstrap: preload default-tf history, let Claude design ----
+    if st["strategy"] is None:
+        fetched, fresh = fetch_all(st, DEFAULT_TF)
+        # preload without any trading (no strategy yet anyway)
         for m, bar in fetched:
-            seen[m] = seen.get(m, 0) + 1
-            if seen[m] <= counts[m] - 30:
-                process_bar(st, m, bar)
-            else:
-                live_tail.append((m, bar))
-        st["strategy"] = strategy_backup
+            if st["candles"][m] and bar["t"] <= st["candles"][m][-1]["t"]:
+                continue
+            process_bar(st, m, bar, allow_entry=False)
         brain.bootstrap(st)
-        for m, bar in live_tail:
-            process_bar(st, m, bar)
-    else:
-        if st["strategy"] is None:
-            brain.bootstrap(st)
-        for m, bar in fetched:
-            process_bar(st, m, bar)
+        st["tf"] = st["strategy"]["timeframe"]
+        if st["tf"] != DEFAULT_TF:
+            wipe_candles(st)
+            log(st, f"Timeframe {st['tf']} chosen - rebuilding candle history.", "ai")
+
+    # ---- timeframe change from a past review ----
+    if st.get("tf") != st["strategy"]["timeframe"]:
+        st["tf"] = st["strategy"]["timeframe"]
+        wipe_candles(st)
+        log(st, f"Timeframe changed to {st['tf']} - rebuilding candle history.", "ai")
+
+    # ---- fetch + trade ----
+    fetched, fresh_markets = fetch_all(st, st["tf"])
+    replay(st, fetched, fresh_markets)
+
+    # feed health: crypto is 24/7, so a long silence there means feeds broke
+    tfm = TF_MIN[st["tf"]]
+    crypto_last = max(st["last_seen"].get(m, 0) for m in ("BTC", "ETH", "SOL"))
+    feed_ok = bool(fetched) or (now_ms() - crypto_last < 3 * tfm * 60_000)
+    if not feed_ok:
+        log(st, "No new candles from any feed for a while - feeds may be down.",
+            "warn")
 
     # ---- self-review when due ----
     if st["trades_since_review"] >= REVIEW_EVERY:
         brain.review(st)
+        if st["strategy"]["timeframe"] != st["tf"]:
+            st["tf"] = st["strategy"]["timeframe"]
+            wipe_candles(st)
+            log(st, f"Timeframe changed to {st['tf']} - rebuilding candle history.",
+                "ai")
 
     # ---- persist full state ----
     with open(STATE_PATH, "w") as f:
         json.dump(st, f)
 
-    # ---- dashboard payload (trimmed) ----
+    # ---- dashboard payload ----
     s = stats(st["trades"])
     data = {
         "updated_at": now_ms(),
@@ -89,6 +126,7 @@ def main():
         "start_balance": 2000,
         "balance": round(st["balance"], 2),
         "equity": round(st["equity"], 2),
+        "timeframe": st.get("tf"),
         "day_anchor": st["day_anchor"],
         "halted": st["halted"],
         "price": st["price"],
@@ -107,7 +145,7 @@ def main():
         json.dump(data, f)
 
     print(f"OK | equity ${st['equity']:.2f} | {s['n']} trades | "
-          f"{len(st['positions'])} open | strategy "
+          f"{len(st['positions'])} open | tf {st.get('tf')} | strategy "
           f"v{st['strategy']['version'] if st['strategy'] else '-'}")
 
 
